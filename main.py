@@ -2,140 +2,208 @@ import os
 import asyncio
 import logging
 import sys
-from datetime import datetime
+import base64
+from datetime import datetime, timezone
+from io import BytesIO
+from typing import Any
+
 from dotenv import load_dotenv
-from aiogram import Bot, Dispatcher, html
+from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+
+# Импорты ваших локальных модулей
 from chroma_store import ChromaStore
 from prompts import SYSTEM_PROMPT
 
+# ================== Настройки ==================
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
 if not TOKEN:
     raise RuntimeError("Please set BOT_TOKEN in .env")
+if not GOOGLE_API_KEY:
+    raise RuntimeError("Please set GOOGLE_API_KEY in .env")
 
-# Chroma persist directory (можно менять)
 CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_data")
+os.makedirs(CHROMA_DIR, exist_ok=True)
+
+# Логирование
+logging.basicConfig(
+    level=logging.INFO, 
+    stream=sys.stdout,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # Инициализация бота
 dp = Dispatcher()
-logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-logger = logging.getLogger(__name__)
+bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
-# Инициализация Chroma store (обёртка)
-chroma = ChromaStore(persist_directory=CHROMA_DIR)
+# Кэш для хранилищ пользователей
+user_chromas = {}
 
-# Фабрика LLM (можно вынести в отдельную функцию/класс)
+# Инициализация LLM
 def make_llm():
-    # Обрати внимание: параметры модели подставь свои по необходимости
     return ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
-        temperature=0.0,
+        temperature=0.3,
         max_retries=2,
+        api_key=GOOGLE_API_KEY
     )
 
 llm = make_llm()
 
+# ================== Утилиты ==================
+
+async def run_sync(func, *args, **kwargs) -> Any:
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+async def get_user_chroma(chat_id: str) -> ChromaStore:
+    if chat_id not in user_chromas:
+        user_dir = os.path.join(CHROMA_DIR, f"user_{chat_id}")
+        await run_sync(os.makedirs, user_dir, exist_ok=True)
+        user_chromas[chat_id] = await run_sync(ChromaStore, persist_directory=user_dir)
+    return user_chromas[chat_id]
+
+def get_utc_now_iso():
+    """Возвращает текущее время UTC в формате ISO (без предупреждений)."""
+    return datetime.now(timezone.utc).isoformat()
+
+# ================== Хендлеры ==================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
         f"Привет, {html.bold(message.from_user.full_name)}!\n"
-        "Я бот с контекстной памятью (Chroma) + Gemini.\n"
-        "Просто напиши сообщение — я отвечу и сохраню историю."
+        "Отправь мне фото, и я расскажу, что на нем, используя зрение Gemini 1.5."
     )
 
+@dp.message(F.photo)
+async def handle_photo(message: Message):
+    """Прямая обработка фото через Gemini Vision."""
+    chat_id_str = str(message.chat.id)
+    # Показываем статус "печатает..."
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("👀 Смотрю на фото...")
 
-@dp.message()
-async def handle_message(message: Message) -> None:
-    """
-    Основной обработчик текста:
-    1. Сохраняет user message в Chroma
-    2. Достаёт релевантный контекст из Chroma (RAG)
-    3. Формирует messages: SystemMessage (PROMPT) + Context (как System/Hints) + HumanMessage
-    4. Вызывает LLM и отправляет ответ
-    5. Сохраняет ответ в Chroma
-    """
-    user_text = message.text or ""
-    if not user_text.strip():
-        # Для нетекстовых типов можно отправить копию/ошибку
+    try:
+        # 1. Скачиваем фото в память
+        photo = message.photo[-1]
+        photo_file = await bot.get_file(photo.file_id)
+        photo_bytes_io = BytesIO()
+        await bot.download_file(photo_file.file_path, photo_bytes_io)
+        photo_data = photo_bytes_io.getvalue()
+
+        # 2. Кодируем в Base64 для Gemini
+        b64_image = base64.b64encode(photo_data).decode('utf-8')
+
+        # 3. Подготовка сообщений (Мультимодальный запрос)
+        # Мы отправляем картинку + просьбу описать её
+        message_content = [
+            {"type": "text", "text": "Опиши подробно, что ты видишь на этом изображении. Если там есть текст, прочитай его."},
+            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
+        ]
+        
+        human_msg = HumanMessage(content=message_content)
+        
+        # Запрос к LLM (Vision)
+        ai_response = await llm.ainvoke([human_msg])
+        ai_text = ai_response.content
+
+        # 4. Отправляем ответ пользователю
+        await status_msg.delete()
+        await send_long_message(message, ai_text)
+
+        # 5. Сохраняем в память (RAG)
+        # Мы сохраняем описание, сгенерированное нейросетью, как "содержание картинки"
+        user_chroma = await get_user_chroma(chat_id_str)
+        ts = get_utc_now_iso()
+        
+        # Сохраняем "запрос" пользователя (факт отправки фото + описание от ИИ как контекст)
+        save_content = f"[Пользователь отправил фото]. Содержание фото: {ai_text}"
+        await run_sync(user_chroma.add_message, role="user", content=save_content, metadata={"ts": ts})
+        
+        # Сохраняем ответ ассистента
+        ts2 = get_utc_now_iso()
+        await run_sync(user_chroma.add_message, role="assistant", content=ai_text, metadata={"ts": ts2})
+        
+        # Persist (может быть deprecated в новых версиях Chroma, но оставим для совместимости)
         try:
-            await message.send_copy(chat_id=message.chat.id)
-        except Exception:
-            await message.answer("Поддерживаются только текстовые сообщения.")
-        return
+            await run_sync(user_chroma.persist)
+        except AttributeError:
+            pass # В новых версиях Chroma сохранение автоматическое
 
-    # 1) Сохранить пользовательское сообщение в Chroma
-    ts = datetime.utcnow().isoformat()
-    chroma.add_message(role="user", content=user_text, metadata={"chat_id": str(message.chat.id), "ts": ts})
-
-    # 2) Получить релевантный контекст (k верхних)
-    context_docs = chroma.get_relevant(user_text, k=4)  # список строк
-
-    # 3) Сформировать сообщения для LLM
-    # SystemMessage с PROMPT
-    system_msg = SystemMessage(content=SYSTEM_PROMPT)
-
-    # Вставим найденный контекст как дополнительный SystemMessage (или можно как assistant/hint)
-    if context_docs:
-        # Соберём контекст в одну строку — коротко
-        context_text = "\n\n".join(context_docs)
-        # Пометим, что это прошлые сообщения (metadata chat etc handled in chroma)
-        system_context_msg = SystemMessage(content=f"Релевантный контекст из истории:\n{context_text}")
-        messages = [system_msg, system_context_msg, HumanMessage(content=user_text)]
-    else:
-        messages = [system_msg, HumanMessage(content=user_text)]
-
-    # 4) Вызов LLM (в отдельном потоке — чтобы не блокировать aiogram loop)
-    try:
-        # llm.invoke может быть блокирующим, поэтому выполняем в worker
-        response = await asyncio.to_thread(lambda: llm.invoke(messages))
-        # response может быть объектом, у которого .content хранит текст
-        # Подстраховываемся: если это dict-like — извлечём подходящее поле
-        ai_text = ""
-        if hasattr(response, "content"):
-            ai_text = response.content
-        elif isinstance(response, dict):
-            # Иногда langchain возвращает {"content": "..."} или {"output": "..."}
-            ai_text = response.get("content") or response.get("output") or str(response)
-        else:
-            ai_text = str(response)
     except Exception as e:
-        logger.exception("LLM call failed")
-        await message.answer(f"Ошибка при обращении к LLM: {e}")
+        logger.exception("Ошибка при обработке фото")
+        await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+
+@dp.message(F.text)
+async def handle_text(message: Message):
+    chat_id_str = str(message.chat.id)
+    user_text = message.text
+    
+    if not user_text:
         return
 
-    # 5) Отправить ответ юзеру
     try:
-        # Ограничиваем длину ответа в telegram (по желанию)
-        await message.answer(ai_text)
-    except Exception:
-        # Если слишком большой, можно отправить частями
-        for chunk in (ai_text[i:i + 4000] for i in range(0, len(ai_text), 4000)):
+        user_chroma = await get_user_chroma(chat_id_str)
+
+        # 1. Сохраняем вопрос
+        ts = get_utc_now_iso()
+        await run_sync(user_chroma.add_message, role="user", content=user_text, metadata={"ts": ts})
+
+        # 2. Ищем контекст
+        context_docs = await run_sync(user_chroma.get_relevant, user_text, k=4)
+        
+        system_msg = SystemMessage(content=SYSTEM_PROMPT)
+        messages = [system_msg]
+
+        if context_docs:
+            context_text = "\n---\n".join(context_docs)
+            messages.append(SystemMessage(content=f"Контекст из памяти:\n{context_text}"))
+        
+        messages.append(HumanMessage(content=user_text))
+
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        ai_response = await llm.ainvoke(messages)
+        ai_text = ai_response.content
+
+        await send_long_message(message, ai_text)
+        
+        ts2 = get_utc_now_iso()
+        await run_sync(user_chroma.add_message, role="assistant", content=ai_text, metadata={"ts": ts2})
+        
+        try:
+            await run_sync(user_chroma.persist)
+        except AttributeError:
+            pass
+
+    except Exception as e:
+        logger.exception("Ошибка при обработке текста")
+        await message.answer("Произошла ошибка при генерации ответа.")
+
+async def send_long_message(message: Message, text: str):
+    if not text: return
+    try:
+        for chunk in (text[i:i + 4000] for i in range(0, len(text), 4000)):
             await message.answer(chunk)
-
-    # 6) Сохранить ответ ассистента в Chroma
-    ts2 = datetime.utcnow().isoformat()
-    chroma.add_message(role="assistant", content=ai_text, metadata={"chat_id": str(message.chat.id), "ts": ts2})
-
-    # Сохраняем persist (на всякий случай; ChromaStore вызывает persist внутри)
-    chroma.persist()
-
+    except Exception as e:
+        logger.error(f"Error sending msg: {e}")
 
 async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    await bot.delete_webhook()
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Бот запущен (Native Gemini Vision mode)...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Stopped by user")
+        logger.info("Бот остановлен")
