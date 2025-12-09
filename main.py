@@ -12,11 +12,13 @@ from aiogram import Bot, Dispatcher, html, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
+from aiogram.types import Message, Voice
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
+# import mimetypes # Не требуется, если мы жестко задаем 'audio/ogg' для голосовых Telegram
 
 # Импорты ваших локальных модулей
+# Убедитесь, что файлы chroma_store.py и prompts.py находятся в том же каталоге
 from chroma_store import ChromaStore
 from prompts import SYSTEM_PROMPT
 
@@ -76,20 +78,102 @@ def get_utc_now_iso():
     """Возвращает текущее время UTC в формате ISO (без предупреждений)."""
     return datetime.now(timezone.utc).isoformat()
 
+async def send_long_message(message: Message, text: str):
+    if not text: return
+    try:
+        # Разбиваем на чанки по 4000 символов для соответствия лимиту Telegram
+        for chunk in (text[i:i + 4000] for i in range(0, len(text), 4000)):
+            await message.answer(chunk)
+    except Exception as e:
+        logger.error(f"Error sending msg: {e}")
+
 # ================== Хендлеры ==================
 
 @dp.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     await message.answer(
         f"Привет, {html.bold(message.from_user.full_name)}!\n"
-        "Отправь мне фото, и я расскажу, что на нем, используя зрение Gemini 1.5."
+        "Отправь мне **фото**, **голосовое сообщение** или **текст**, и я отвечу."
     )
+    
+@dp.message(F.voice)
+async def handle_voice(message: Message):
+    """
+    Обработка голосовых сообщений (STT + LLM) с использованием Gemini.
+    """
+    chat_id_str = str(message.chat.id)
+    voice: Voice = message.voice
+    
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("🎧 Распознаю голосовое и думаю...")
+
+    try:
+        # 1. Скачиваем голосовое сообщение в память (OGG/Opus)
+        voice_file = await bot.get_file(voice.file_id)
+        voice_bytes_io = BytesIO()
+        await bot.download_file(voice_file.file_path, voice_bytes_io)
+        voice_data = voice_bytes_io.getvalue()
+        
+        # 2. Кодируем в Base64 для Gemini
+        b64_audio = base64.b64encode(voice_data).decode('utf-8')
+        mime_type = 'audio/ogg' 
+        
+        # 3. Поиск контекста
+        user_chroma = await get_user_chroma(chat_id_str)
+        context_docs = await run_sync(user_chroma.get_relevant, "Предыдущий разговор", k=4) 
+        
+        system_msg = SystemMessage(content=SYSTEM_PROMPT)
+        messages = [system_msg]
+
+        if context_docs:
+            context_text = "\n---\n".join(context_docs)
+            messages.append(SystemMessage(content=f"Контекст из памяти:\n{context_text}"))
+        
+        # 4. Подготовка мультимодального сообщения (ИСПРАВЛЕНО)
+        # Используем универсальный формат: {'data': Base64, 'mime_type': MIME}
+        message_content = [
+            {"type": "text", "text": "Расшифруй это голосовое сообщение и ответь на него, используя контекст нашей предыдущей беседы. Сначала дай расшифровку, а потом ответ."},
+            {
+                "data": b64_audio, 
+                "mime_type": mime_type # 'audio/ogg'
+            }
+        ]
+        
+        human_msg = HumanMessage(content=message_content)
+        messages.append(human_msg)
+
+        # 5. Запрос к LLM (STT + Чат)
+        ai_response = await llm.ainvoke(messages)
+        ai_text = ai_response.content
+        
+        # 6. Отправляем ответ пользователю
+        await status_msg.delete()
+        await send_long_message(message, ai_text)
+
+        # 7. Сохраняем в память (RAG)
+        # Сохраняем "запрос" пользователя (факт отправки аудио + ответ ИИ как контекст)
+        save_user_content = f"[Пользователь отправил голосовое сообщение]. Расшифровка и ответ: {ai_text}"
+        ts = get_utc_now_iso()
+        await run_sync(user_chroma.add_message, role="user", content=save_user_content, metadata={"ts": ts})
+        
+        # Сохраняем ответ ассистента
+        ts2 = get_utc_now_iso()
+        await run_sync(user_chroma.add_message, role="assistant", content=ai_text, metadata={"ts": ts2})
+        
+        try:
+            await run_sync(user_chroma.persist)
+        except AttributeError:
+            pass 
+
+    except Exception as e:
+        logger.exception("Ошибка при обработке голосового сообщения")
+        await status_msg.edit_text(f"⚠️ Ошибка при обработке голосового: {e}")
+
 
 @dp.message(F.photo)
 async def handle_photo(message: Message):
     """Прямая обработка фото через Gemini Vision."""
     chat_id_str = str(message.chat.id)
-    # Показываем статус "печатает..."
     await bot.send_chat_action(chat_id=message.chat.id, action="typing")
     status_msg = await message.answer("👀 Смотрю на фото...")
 
@@ -105,9 +189,8 @@ async def handle_photo(message: Message):
         b64_image = base64.b64encode(photo_data).decode('utf-8')
 
         # 3. Подготовка сообщений (Мультимодальный запрос)
-        # Мы отправляем картинку + просьбу описать её
         message_content = [
-            {"type": "text", "text": "Опиши подробно, что ты видишь на этом изображении. Если там есть текст, прочитай его."},
+            {"type": "text", "text": "Опиши как решить проблему с растением если на фото картина с растением"},
             {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"}}
         ]
         
@@ -122,23 +205,19 @@ async def handle_photo(message: Message):
         await send_long_message(message, ai_text)
 
         # 5. Сохраняем в память (RAG)
-        # Мы сохраняем описание, сгенерированное нейросетью, как "содержание картинки"
         user_chroma = await get_user_chroma(chat_id_str)
         ts = get_utc_now_iso()
         
-        # Сохраняем "запрос" пользователя (факт отправки фото + описание от ИИ как контекст)
         save_content = f"[Пользователь отправил фото]. Содержание фото: {ai_text}"
         await run_sync(user_chroma.add_message, role="user", content=save_content, metadata={"ts": ts})
         
-        # Сохраняем ответ ассистента
         ts2 = get_utc_now_iso()
         await run_sync(user_chroma.add_message, role="assistant", content=ai_text, metadata={"ts": ts2})
         
-        # Persist (может быть deprecated в новых версиях Chroma, но оставим для совместимости)
         try:
             await run_sync(user_chroma.persist)
         except AttributeError:
-            pass # В новых версиях Chroma сохранение автоматическое
+            pass
 
     except Exception as e:
         logger.exception("Ошибка при обработке фото")
@@ -189,17 +268,9 @@ async def handle_text(message: Message):
         logger.exception("Ошибка при обработке текста")
         await message.answer("Произошла ошибка при генерации ответа.")
 
-async def send_long_message(message: Message, text: str):
-    if not text: return
-    try:
-        for chunk in (text[i:i + 4000] for i in range(0, len(text), 4000)):
-            await message.answer(chunk)
-    except Exception as e:
-        logger.error(f"Error sending msg: {e}")
-
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
-    logger.info("Бот запущен (Native Gemini Vision mode)...")
+    logger.info("Бот запущен (Native Gemini Vision/Audio mode)...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
